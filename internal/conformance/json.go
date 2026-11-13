@@ -22,14 +22,23 @@ import (
 )
 
 type jsonReport struct {
-	Date         string              `json:"date"`
-	Repo         jsonRepo            `json:"repo"`
-	Scorecard    jsonScorecard       `json:"scorecard"`
-	Catalog      jsonCatalog         `json:"catalog"`
-	Profile      string              `json:"profile"`
-	Results      []RequirementResult `json:"results"`
-	NotEvaluated []string            `json:"notEvaluated"`
-	Experimental bool                `json:"experimental"`
+	Date          string              `json:"date"`
+	Repo          jsonRepo            `json:"repo"`
+	Scorecard     jsonScorecard       `json:"scorecard"`
+	Catalog       jsonCatalog         `json:"catalog"`
+	Profile       string              `json:"profile"`
+	Results       []RequirementResult `json:"results"`
+	NotEvaluated  []string            `json:"notEvaluated"`
+	ProbeFailures []jsonProbeFailure  `json:"probeFailures,omitempty"`
+	Experimental  bool                `json:"experimental"`
+}
+
+// jsonProbeFailure records a probe that could not produce findings and the
+// reason. It appears only in a degraded run, so the normal-path output shape
+// is unchanged.
+type jsonProbeFailure struct {
+	Probe   string `json:"probe"`
+	Message string `json:"message"`
 }
 
 type jsonRepo struct {
@@ -58,6 +67,12 @@ func (r *Report) AsJSON(w io.Writer) error {
 		Profile:      r.Profile,
 		Results:      r.Results,
 		NotEvaluated: r.NotEvaluated,
+	}
+	for i := range r.FailedProbes {
+		out.ProbeFailures = append(out.ProbeFailures, jsonProbeFailure{
+			Probe:   r.FailedProbes[i].Probe,
+			Message: r.FailedProbes[i].Message,
+		})
 	}
 	if out.Results == nil {
 		out.Results = []RequirementResult{}

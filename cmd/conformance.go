@@ -62,6 +62,10 @@ func runConformance(ctx context.Context, o *options.Options, uri string) error {
 		scorecard.WithCommitSHA(o.Commit),
 		scorecard.WithCommitDepth(o.CommitDepth),
 		scorecard.WithProbes(probes),
+		// A failed probe must not discard the whole conformance report.
+		// The failure is recorded, affected requirements come out UNKNOWN,
+		// and the other requirements are still evaluated.
+		scorecard.WithTolerantProbes(),
 	}
 	if strings.EqualFold(o.FileMode, options.FileModeGit) {
 		opts = append(opts, scorecard.WithFileModeGit())
@@ -107,9 +111,17 @@ func conformanceReport(result *scorecard.Result, release *conformance.Release, p
 	if defaultBranch == unknownBranch {
 		defaultBranch = ""
 	}
+	var probeErrors []conformance.ProbeError
+	for i := range result.ProbeErrors {
+		probeErrors = append(probeErrors, conformance.ProbeError{
+			Probe:   result.ProbeErrors[i].Probe,
+			Message: result.ProbeErrors[i].Message,
+		})
+	}
 	in := conformance.Input{
 		DefaultBranch: defaultBranch,
 		Findings:      result.Findings,
+		ProbeErrors:   probeErrors,
 	}
 	results, notEvaluated := conformance.Evaluate(release, profile, in)
 	return &conformance.Report{
@@ -122,6 +134,7 @@ func conformanceReport(result *scorecard.Result, release *conformance.Release, p
 		Profile:          profile,
 		Results:          results,
 		NotEvaluated:     notEvaluated,
+		FailedProbes:     probeErrors,
 	}
 }
 

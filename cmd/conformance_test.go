@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,6 +116,142 @@ func TestConformanceReportEmptyRepository(t *testing.T) {
 		if r.Result != conformance.Unknown {
 			t.Errorf("%s = %s, want UNKNOWN", r.Requirement, r.Result)
 		}
+	}
+}
+
+// TestConformanceReportProbeFailure covers a degraded scan: the branch
+// protection data could not be fetched, so every mapped probe failed. The
+// report is still produced, every mapped requirement is UNKNOWN with the
+// probe and reason named, and the failures are recorded on the report.
+func TestConformanceReportProbeFailure(t *testing.T) {
+	t.Parallel()
+	release, err := catalog.Lookup("osps-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedProbes := []scorecard.ProbeError{
+		{Probe: "blocksDeleteOnBranches", Message: "internal error: collect failed"},
+		{Probe: "branchProtectionAppliesToAdmins", Message: "internal error: collect failed"},
+		{Probe: "branchesAreProtected", Message: "internal error: collect failed"},
+		{Probe: "requiresPRsToChangeCode", Message: "internal error: collect failed"},
+	}
+	result := scanResult("main")
+	result.ProbeErrors = failedProbes
+	report := conformanceReport(result, release, "maturity-1")
+
+	if len(report.FailedProbes) != len(failedProbes) {
+		t.Fatalf("report records %d failed probes, want %d: %v",
+			len(report.FailedProbes), len(failedProbes), report.FailedProbes)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("got %d results, want the two mapped requirements", len(report.Results))
+	}
+	for _, r := range report.Results {
+		if r.Result != conformance.Unknown {
+			t.Errorf("%s = %s, want UNKNOWN because its probes failed", r.Requirement, r.Result)
+		}
+		if !strings.Contains(r.Explanation, "failed") ||
+			!strings.Contains(r.Explanation, "internal error: collect failed") {
+			t.Errorf("%s explanation does not name the probe failure: %q", r.Requirement, r.Explanation)
+		}
+	}
+	// The other profile requirements are still not evaluated, not failed.
+	if got := len(report.NotEvaluated); got != 23 {
+		t.Errorf("got %d requirements not evaluated, want 23", got)
+	}
+}
+
+// TestConformanceReportProbeFailureOutputs pins the degraded output for both
+// formats: the JSON names the failed probe at the top level, and the Gemara
+// log's overall result is Unknown rather than Passed.
+func TestConformanceReportProbeFailureOutputs(t *testing.T) {
+	t.Parallel()
+	release, err := catalog.Lookup("osps-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := scanResult("main")
+	result.ProbeErrors = []scorecard.ProbeError{{
+		Probe:   "blocksDeleteOnBranches",
+		Message: "internal error: collect failed",
+	}}
+	report := conformanceReport(result, release, "maturity-1")
+
+	var jsonOut bytes.Buffer
+	if err := writeConformance(&jsonOut, options.FormatJSON, report); err != nil {
+		t.Fatalf("writeConformance(json) = %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(jsonOut.Bytes(), &decoded); err != nil {
+		t.Fatalf("JSON output is not valid: %v", err)
+	}
+	failures, ok := decoded["probeFailures"].([]any)
+	if !ok || len(failures) != 1 {
+		t.Fatalf("JSON probeFailures = %v, want one entry", decoded["probeFailures"])
+	}
+	entry, ok := failures[0].(map[string]any)
+	if !ok {
+		t.Fatalf("JSON probe failure entry = %v, want an object", failures[0])
+	}
+	if entry["probe"] != "blocksDeleteOnBranches" ||
+		entry["message"] != "internal error: collect failed" {
+		t.Errorf("JSON probe failure entry = %+v", entry)
+	}
+
+	var gemaraOut bytes.Buffer
+	if err := writeConformance(&gemaraOut, options.FormatGemara, report); err != nil {
+		t.Fatalf("writeConformance(gemara) = %v", err)
+	}
+	var gemara struct {
+		Result   string `json:"result"`
+		Metadata struct {
+			Description string `json:"description"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(gemaraOut.Bytes(), &gemara); err != nil {
+		t.Fatalf("Gemara output is not valid: %v", err)
+	}
+	if gemara.Result != "Unknown" {
+		t.Errorf("Gemara result = %q, want Unknown", gemara.Result)
+	}
+	if !strings.Contains(gemara.Metadata.Description, "blocksDeleteOnBranches") {
+		t.Errorf("Gemara description does not name the failed probe: %q",
+			gemara.Metadata.Description)
+	}
+}
+
+// TestConformanceReportPartialProbeFailure pins that requirements whose
+// probes completed are still evaluated when another probe failed.
+func TestConformanceReportPartialProbeFailure(t *testing.T) {
+	t.Parallel()
+	release, err := catalog.Lookup("osps-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := scanResult("main",
+		onBranch("blocksDeleteOnBranches", "main", finding.OutcomeTrue),
+	)
+	result.ProbeErrors = []scorecard.ProbeError{{
+		Probe:   "requiresPRsToChangeCode",
+		Message: "internal error: collect failed",
+	}}
+	report := conformanceReport(result, release, "maturity-1")
+
+	byReq := map[string]conformance.RequirementResult{}
+	for _, r := range report.Results {
+		byReq[r.Requirement] = r
+	}
+	// AC-03.02's only probe succeeded, so it still passes.
+	if r := byReq["OSPS-AC-03.02"]; r.Result != conformance.Pass {
+		t.Errorf("OSPS-AC-03.02 = %s, want PASS: its probe did not fail", r.Result)
+	}
+	// AC-03.01 needs the failed probe, so it is Unknown and never FAIL.
+	r := byReq["OSPS-AC-03.01"]
+	if r.Result != conformance.Unknown {
+		t.Errorf("OSPS-AC-03.01 = %s, want UNKNOWN", r.Result)
+	}
+	if !strings.Contains(r.Explanation, "requiresPRsToChangeCode") {
+		t.Errorf("OSPS-AC-03.01 explanation does not name the failed probe: %q", r.Explanation)
 	}
 }
 

@@ -119,6 +119,98 @@ func TestEvaluate(t *testing.T) {
 	}
 }
 
+// TestEvaluateProbeFailure pins the degraded path: a requirement that needs
+// a failed probe is Unknown with the probe and reason named, and is never
+// failed for lack of evidence. Requirements that do not need the failed
+// probe are still evaluated by their mapping.
+func TestEvaluateProbeFailure(t *testing.T) {
+	t.Parallel()
+	rel := testRelease()
+	in := Input{
+		ProbeErrors: []ProbeError{{Probe: "probeA", Message: "internal error: collect failed"}},
+	}
+	results, _ := Evaluate(rel, "level-1", in)
+
+	byID := map[string]RequirementResult{}
+	for _, r := range results {
+		byID[r.Requirement] = r
+	}
+	// TEST-01.01, .02, .03 and .04 all read probeA: they are Unknown and
+	// the mapping's own result is never reached.
+	for _, id := range []string{"TEST-01.01", "TEST-01.02", "TEST-01.03", "TEST-01.04"} {
+		r := byID[id]
+		if r.Result != Unknown {
+			t.Errorf("%s = %s, want UNKNOWN because probeA failed", id, r.Result)
+		}
+		wantExpl := "Probe probeA failed, so its evidence is missing: internal error: collect failed."
+		if r.Explanation != wantExpl {
+			t.Errorf("%s explanation = %q, want %q", id, r.Explanation, wantExpl)
+		}
+		if r.Evidence == nil {
+			t.Errorf("%s: evidence is nil, want an empty list", id)
+		}
+	}
+	// TEST-01.05 is outside the profile: the failed probe must not change
+	// its NOT_APPLICABLE result.
+	if r := byID["TEST-01.05"]; r.Result != NotApplicable {
+		t.Errorf("TEST-01.05 = %s, want NOT_APPLICABLE", r.Result)
+	}
+}
+
+// TestEvaluateProbeFailureKeepsPartialEvidence checks that findings the
+// failed probe did produce before failing stay on the requirement as
+// evidence.
+func TestEvaluateProbeFailureKeepsPartialEvidence(t *testing.T) {
+	t.Parallel()
+	rel := testRelease()
+	partial := finding.Finding{
+		Probe:   "probeA",
+		Outcome: finding.OutcomeTrue,
+		Message: "observed on branch 'main'",
+		Values:  map[string]string{"branchName": "main"},
+	}
+	in := Input{
+		Findings:    []finding.Finding{partial, testFinding},
+		ProbeErrors: []ProbeError{{Probe: "probeA", Message: "boom"}},
+	}
+	results, _ := Evaluate(rel, "level-1", in)
+	var got RequirementResult
+	for _, r := range results {
+		if r.Requirement == "TEST-01.01" {
+			got = r
+		}
+	}
+	if got.Result != Unknown {
+		t.Fatalf("TEST-01.01 = %s, want UNKNOWN", got.Result)
+	}
+	if diff := cmp.Diff([]finding.Finding{partial}, got.Evidence,
+		cmp.AllowUnexported(finding.Finding{})); diff != "" {
+		t.Errorf("evidence (-want +got):\n%s", diff)
+	}
+}
+
+func TestEvaluateOneFailedProbeDoesNotTouchOthers(t *testing.T) {
+	t.Parallel()
+	rel := testRelease()
+	// TEST-01.05 reads probeLevel3 only, and only applies at level-3.
+	rel.Mappings[4].Evaluate = fixed(Pass, "The level 3 setting is on.")
+	in := Input{
+		ProbeErrors: []ProbeError{{Probe: "probeA", Message: "boom"}},
+	}
+	results, _ := Evaluate(rel, "level-3", in)
+	for _, r := range results {
+		if r.Requirement != "TEST-01.05" {
+			continue
+		}
+		if r.Result != Pass {
+			t.Errorf("TEST-01.05 = %s, want PASS: its probe did not fail", r.Result)
+		}
+		if r.Explanation != "The level 3 setting is on." {
+			t.Errorf("TEST-01.05 explanation = %q, want the mapping's own text", r.Explanation)
+		}
+	}
+}
+
 func TestEvaluateInsideProfile(t *testing.T) {
 	t.Parallel()
 	rel := testRelease()

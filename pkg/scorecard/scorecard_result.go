@@ -58,6 +58,21 @@ type Result struct {
 	Findings   []finding.Finding
 	Metadata   []string
 	Config     config.Config
+	// ProbeErrors names each probe that could not produce findings, with
+	// the error that stopped it. It is populated only when tolerant probe
+	// mode is enabled, as conformance mode does. A probe is listed at most
+	// once. The run still completes, and the other probes' findings are
+	// reported, so a failed probe is read as missing evidence rather than
+	// as a failed run.
+	ProbeErrors []ProbeError
+}
+
+// ProbeError records that a probe could not be run. Message is the error
+// the probe or its raw data collection returned; it is the text conformance
+// output quotes when it explains why a requirement is UNKNOWN.
+type ProbeError struct {
+	Probe   string
+	Message string
 }
 
 // AsStringResultOption provides configuration options for string Scorecard results.

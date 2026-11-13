@@ -36,6 +36,7 @@ import (
 	"github.com/ossf/scorecard/v5/config"
 	sce "github.com/ossf/scorecard/v5/errors"
 	"github.com/ossf/scorecard/v5/finding"
+	"github.com/ossf/scorecard/v5/internal/checkdef"
 	"github.com/ossf/scorecard/v5/internal/packageclient"
 	proberegistration "github.com/ossf/scorecard/v5/internal/probes"
 	sclog "github.com/ossf/scorecard/v5/log"
@@ -96,6 +97,7 @@ func runScorecard(ctx context.Context,
 	ciiClient clients.CIIBestPracticesClient,
 	vulnsClient clients.VulnerabilitiesClient,
 	projectClient packageclient.ProjectPackageClient,
+	tolerant bool,
 ) (Result, error) {
 	if err := repoClient.InitRepo(repo, commitSHA, commitDepth); err != nil {
 		// No need to call sce.WithMessage() since InitRepo will do that for us.
@@ -166,6 +168,10 @@ func runScorecard(ctx context.Context,
 
 	// If the user runs probes
 	if len(probesToRun) > 0 {
+		if tolerant {
+			runEnabledProbesTolerant(request, probesToRun, &ret)
+			return ret, nil
+		}
 		err = runEnabledProbes(request, probesToRun, &ret)
 		if err != nil {
 			return Result{}, err
@@ -251,6 +257,85 @@ func runEnabledProbes(request *checker.CheckRequest,
 	return nil
 }
 
+// runEnabledProbesTolerant runs the probes without ending the run when one
+// fails. A failed probe is recorded in ret.ProbeErrors, once, and the other
+// probes still run. Raw data is collected once per check, as in the strict
+// path; when a collector fails, every probe that needs that check's data is
+// marked failed without re-attempting the collection.
+func runEnabledProbesTolerant(request *checker.CheckRequest,
+	probesToRun []string,
+	ret *Result,
+) {
+	// Collect each needed check's raw data once, recording failures per
+	// check so the data is never fetched a second time.
+	collectErrors := map[string]string{}
+	seen := map[string]bool{}
+	for _, probeName := range probesToRun {
+		p, err := proberegistration.Get(probeName)
+		if err != nil {
+			// Lookup errors are recorded with the probe below.
+			continue
+		}
+		for _, checkName := range p.RequiredRawData {
+			if seen[checkName] || collectErrors[checkName] != "" {
+				continue
+			}
+			if err := checkdef.CollectRawData(checkName, request, &ret.RawResults); err != nil {
+				collectErrors[checkName] = err.Error()
+				continue
+			}
+			seen[checkName] = true
+		}
+	}
+
+	probeFindings := make([]finding.Finding, 0)
+	for _, probeName := range probesToRun {
+		probe, err := proberegistration.Get(probeName)
+		if err != nil {
+			ret.ProbeErrors = append(ret.ProbeErrors, ProbeError{
+				Probe:   probeName,
+				Message: err.Error(),
+			})
+			continue
+		}
+		// A probe whose raw data could not be collected cannot run. Quote
+		// the collector's error once for this probe.
+		if msg, failed := firstCollectError(probe, collectErrors); failed {
+			ret.ProbeErrors = append(ret.ProbeErrors, ProbeError{
+				Probe:   probeName,
+				Message: msg,
+			})
+			continue
+		}
+		var findings []finding.Finding
+		if probe.IndependentImplementation != nil {
+			findings, _, err = probe.IndependentImplementation(request)
+		} else {
+			findings, _, err = probe.Implementation(&ret.RawResults)
+		}
+		if err != nil {
+			ret.ProbeErrors = append(ret.ProbeErrors, ProbeError{
+				Probe:   probeName,
+				Message: err.Error(),
+			})
+			continue
+		}
+		probeFindings = append(probeFindings, findings...)
+	}
+	ret.Findings = probeFindings
+}
+
+// firstCollectError returns the error of the first failed raw data check the
+// probe needs, and false when all of its data was collected.
+func firstCollectError(probe proberegistration.Probe, collectErrors map[string]string) (string, bool) {
+	for _, checkName := range probe.RequiredRawData {
+		if msg, ok := collectErrors[checkName]; ok {
+			return msg, true
+		}
+	}
+	return "", false
+}
+
 type runConfig struct {
 	client        clients.RepoClient
 	vulnClient    clients.VulnerabilitiesClient
@@ -263,6 +348,7 @@ type runConfig struct {
 	probes        []string
 	commitDepth   int
 	gitMode       bool
+	tolerant      bool
 }
 
 type Option func(*runConfig) error
@@ -358,6 +444,18 @@ func WithFileModeGit() Option {
 	}
 }
 
+// WithTolerantProbes makes probe mode record a failed probe in the Result's
+// ProbeErrors and continue with the other probes, instead of ending the run
+// with an error. Conformance mode uses this so that one failed probe makes the
+// affected requirements UNKNOWN rather than losing the whole report. It has
+// no effect without WithProbes.
+func WithTolerantProbes() Option {
+	return func(c *runConfig) error {
+		c.tolerant = true
+		return nil
+	}
+}
+
 // Run analyzes a given repository and returns the result. You can modify the
 // run behavior by passing in [Option] arguments. In the absence of a particular
 // option a default is used. Refer to the various Options for details.
@@ -431,5 +529,5 @@ func Run(ctx context.Context, repo clients.Repo, opts ...Option) (Result, error)
 	}
 
 	return runScorecard(ctx, repo, c.commit, c.commitDepth, checksToRun, c.probes,
-		c.client, c.ossfuzzClient, c.ciiClient, c.vulnClient, c.projectClient)
+		c.client, c.ossfuzzClient, c.ciiClient, c.vulnClient, c.projectClient, c.tolerant)
 }

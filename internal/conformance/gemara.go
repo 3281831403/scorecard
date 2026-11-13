@@ -231,6 +231,15 @@ func (r *Report) AsGemara(w io.Writer) error {
 		all = append(all, e.Result)
 	}
 
+	// When a probe could not run, the log cannot claim a result better
+	// than Unknown: some assessments rest on evidence that was never
+	// collected. Failed outranks Unknown in the aggregate, so a genuine
+	// failure still rolls up as Failed.
+	logResult := aggregate(all)
+	if len(r.FailedProbes) > 0 && aggregateRank(logResult) < aggregateRank(gemaraUnknown) {
+		logResult = gemaraUnknown
+	}
+
 	out := gemaraLog{
 		Metadata: gemaraMetadata{
 			ID:            fmt.Sprintf("scorecard:%s@%s:%s@%s:%s", r.Repo, r.Commit, rel.Catalog, rel.Version, r.Profile),
@@ -259,7 +268,7 @@ func (r *Report) AsGemara(w io.Writer) error {
 			Version: r.Commit,
 			URI:     repoURI(r.Repo),
 		},
-		Result:      aggregate(all),
+		Result:      logResult,
 		Evaluations: evals,
 	}
 
@@ -272,7 +281,9 @@ func (r *Report) AsGemara(w io.Writer) error {
 }
 
 // description states what the log covers, so that a partial run is not
-// read as conformance with the whole catalog.
+// read as conformance with the whole catalog. When probes failed, it names
+// them and states that the run is incomplete, matching the Unknown overall
+// result.
 func (r *Report) description() string {
 	evaluated := 0
 	for i := range r.Results {
@@ -280,11 +291,27 @@ func (r *Report) description() string {
 			evaluated++
 		}
 	}
-	return fmt.Sprintf("Experimental OpenSSF Scorecard evaluation of %s against %s %s (%s). "+
+	description := fmt.Sprintf("Experimental OpenSSF Scorecard evaluation of %s against %s %s (%s). "+
 		"%d of the %d requirements in the profile were evaluated; the other %d were not evaluated "+
 		"and are not in this log.",
 		r.Repo, r.Release.Catalog, r.Release.Version, r.Profile,
 		evaluated, evaluated+len(r.NotEvaluated), len(r.NotEvaluated))
+	if len(r.FailedProbes) == 0 {
+		return description
+	}
+	return description + " " + probeFailuresDescription(r.FailedProbes)
+}
+
+// probeFailuresDescription lists the failed probes and their reasons in a
+// stable order, since the run records them in probe execution order.
+func probeFailuresDescription(failures []ProbeError) string {
+	parts := make([]string, 0, len(failures))
+	for i := range failures {
+		parts = append(parts, fmt.Sprintf("%s (%s)", failures[i].Probe, failures[i].Message))
+	}
+	return fmt.Sprintf("%d probe(s) failed and produced no evidence: %s. "+
+		"The overall result is Unknown because requirements that need this evidence could not be decided.",
+		len(failures), strings.Join(parts, "; "))
 }
 
 // scorecardCommitURI links to the Scorecard commit that produced the log,

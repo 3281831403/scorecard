@@ -16,10 +16,12 @@ package conformance
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,6 +119,143 @@ func TestAsJSONEmptyLists(t *testing.T) {
 		if !bytes.Contains(b.Bytes(), []byte(want)) {
 			t.Errorf("AsJSON() output lacks %s:\n%s", want, b.String())
 		}
+	}
+}
+
+// degradedReport is a test report whose run had a failed probe.
+func degradedReport() *Report {
+	r := testReport()
+	r.FailedProbes = []ProbeError{{
+		Probe:   "probeA",
+		Message: "internal error: collect failed",
+	}}
+	return r
+}
+
+// TestAsJSONProbeFailures pins the degraded JSON shape: the failed probe and
+// its reason appear at the top level, and the normal-path keys stay.
+func TestAsJSONProbeFailures(t *testing.T) {
+	t.Parallel()
+	var b bytes.Buffer
+	if err := degradedReport().AsJSON(&b); err != nil {
+		t.Fatalf("AsJSON() error = %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b.Bytes(), &out); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	failures, ok := out["probeFailures"].([]any)
+	if !ok || len(failures) != 1 {
+		t.Fatalf("probeFailures = %v, want one entry", out["probeFailures"])
+	}
+	entry, ok := failures[0].(map[string]any)
+	if !ok {
+		t.Fatalf("probe failure entry = %v, want an object", failures[0])
+	}
+	if entry["probe"] != "probeA" || entry["message"] != "internal error: collect failed" {
+		t.Errorf("probeFailures entry = %+v", entry)
+	}
+	// Results still carry the per-requirement Unknown explanation.
+	results, ok := out["results"].([]any)
+	if !ok {
+		t.Fatalf("results = %v, want a list", out["results"])
+	}
+	if len(results) == 0 {
+		t.Fatal("degraded report has no results")
+	}
+}
+
+// TestAsJSONNoProbeFailuresKeyOnNormalRun pins that a run without failures
+// keeps the normal-path output shape, including the golden files.
+func TestAsJSONNoProbeFailuresKeyOnNormalRun(t *testing.T) {
+	t.Parallel()
+	var b bytes.Buffer
+	if err := testReport().AsJSON(&b); err != nil {
+		t.Fatalf("AsJSON() error = %v", err)
+	}
+	if bytes.Contains(b.Bytes(), []byte("probeFailures")) {
+		t.Errorf("normal run output must not carry probeFailures:\n%s", b.String())
+	}
+}
+
+// TestAsGemaraProbeFailures pins the degraded Gemara shape: the top-level
+// result is Unknown and the description names the failed probe, even when
+// every evaluated requirement passed.
+func TestAsGemaraProbeFailures(t *testing.T) {
+	t.Parallel()
+	r := degradedReport()
+	// Make every evaluated requirement pass, so the only thing keeping the
+	// log from "Passed" is the failed probe.
+	for i := range r.Results {
+		if r.Results[i].Result != NotApplicable {
+			r.Results[i].Result = Pass
+		}
+	}
+	var b bytes.Buffer
+	if err := r.AsGemara(&b); err != nil {
+		t.Fatalf("AsGemara() error = %v", err)
+	}
+	var out struct {
+		Result   string `json:"result"`
+		Metadata struct {
+			Description string `json:"description"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(b.Bytes(), &out); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	if out.Result != gemaraUnknown {
+		t.Errorf("top-level result = %q, want %q because a probe failed", out.Result, gemaraUnknown)
+	}
+	for _, want := range []string{"probeA", "internal error: collect failed", "Unknown"} {
+		if !strings.Contains(out.Metadata.Description, want) {
+			t.Errorf("description %q does not contain %q", out.Metadata.Description, want)
+		}
+	}
+}
+
+// TestAsGemaraFailedOutranksProbeFailure pins that a genuine failure still
+// rolls up as Failed: probe failures cap the result at Unknown but do not
+// hide a requirement that actually failed.
+func TestAsGemaraFailedOutranksProbeFailure(t *testing.T) {
+	t.Parallel()
+	r := degradedReport()
+	for i := range r.Results {
+		if r.Results[i].Requirement == "TEST-01.02" {
+			r.Results[i].Result = Fail
+		}
+	}
+	var b bytes.Buffer
+	if err := r.AsGemara(&b); err != nil {
+		t.Fatalf("AsGemara() error = %v", err)
+	}
+	var out struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(b.Bytes(), &out); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	if out.Result != gemaraFailed {
+		t.Errorf("top-level result = %q, want %q", out.Result, gemaraFailed)
+	}
+}
+
+// TestDescriptionProbeFailures pins the description wording so a partial run
+// cannot be read as conformance with the whole catalog.
+func TestDescriptionProbeFailures(t *testing.T) {
+	t.Parallel()
+	r := degradedReport()
+	got := r.description()
+	if !strings.Contains(got, "1 probe(s) failed") || !strings.Contains(got, "probeA (internal error: collect failed)") {
+		t.Errorf("description = %q", got)
+	}
+	if !strings.HasSuffix(got, "could not be decided.") {
+		t.Errorf("description does not end with the Unknown explanation: %q", got)
+	}
+	// The normal description is unchanged.
+	normal := testReport().description()
+	if strings.Contains(normal, "probe") && strings.Contains(normal, "failed") {
+		t.Errorf("normal description mentions probe failures: %q", normal)
 	}
 }
 

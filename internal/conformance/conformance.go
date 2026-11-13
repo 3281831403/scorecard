@@ -72,6 +72,20 @@ type Input struct {
 	DefaultBranch string
 	// Findings are the findings of the probes the mappings name.
 	Findings []finding.Finding
+	// ProbeErrors names the probes that could not produce findings, with
+	// the error that stopped them. A requirement whose mapping names one of
+	// these probes is evaluated as Unknown, because the evidence it needs
+	// was never collected, rather than shown to be missing.
+	ProbeErrors []ProbeError
+}
+
+// ProbeError records that a probe could not be run. Message explains why,
+// such as a failed API call while collecting the probe's raw data.
+type ProbeError struct {
+	// Probe is the ID of the probe that failed.
+	Probe string
+	// Message is the error the probe or its raw data collection returned.
+	Message string
 }
 
 // Outcome is what an evaluation function returns for one requirement.
@@ -182,11 +196,20 @@ type Report struct {
 	Profile          string
 	Results          []RequirementResult
 	NotEvaluated     []string
+	// FailedProbes records each probe that could not produce findings
+	// during the run. Requirements that need one of these probes are
+	// Unknown; the others are evaluated normally. An empty list means every
+	// requested probe completed.
+	FailedProbes []ProbeError
 }
 
 // Evaluate evaluates every mapped requirement in the release for the
 // profile. It returns results in catalog order, and the IDs of the
 // requirements in the profile that have no mapping.
+//
+// A requirement whose mapping names a probe that could not run is evaluated
+// as Unknown, with an explanation naming the probe and the reason: missing
+// evidence is never read as an unconfigured setting.
 func Evaluate(release *Release, profile string, in Input) ([]RequirementResult, []string) {
 	var results []RequirementResult
 	var notEvaluated []string
@@ -206,7 +229,7 @@ func Evaluate(release *Release, profile string, in Input) ([]RequirementResult, 
 				Evidence:    []finding.Finding{},
 			})
 		default:
-			out := m.Evaluate(in)
+			out := evaluateMapping(m, in)
 			evidence := out.Evidence
 			if evidence == nil {
 				evidence = []finding.Finding{}
@@ -220,6 +243,50 @@ func Evaluate(release *Release, profile string, in Input) ([]RequirementResult, 
 		}
 	}
 	return results, notEvaluated
+}
+
+// evaluateMapping runs the mapping's evaluation, unless one of its probes
+// failed, in which case the requirement is Unknown with the probe named.
+func evaluateMapping(m *Mapping, in Input) Outcome {
+	for _, probe := range m.Probes {
+		if msg, failed := probeError(in, probe); failed {
+			return Outcome{
+				Result:      Unknown,
+				Explanation: probeFailureExplanation(probe, msg),
+				Evidence:    evidenceForProbe(in, probe),
+			}
+		}
+	}
+	return m.Evaluate(in)
+}
+
+// probeError returns the recorded error for the probe, and false when the
+// probe completed.
+func probeError(in Input, probe string) (string, bool) {
+	for i := range in.ProbeErrors {
+		if in.ProbeErrors[i].Probe == probe {
+			return in.ProbeErrors[i].Message, true
+		}
+	}
+	return "", false
+}
+
+// probeFailureExplanation names the probe that failed and why, so a reader
+// can tell missing evidence from an observed missing setting.
+func probeFailureExplanation(probe, msg string) string {
+	return fmt.Sprintf("Probe %s failed, so its evidence is missing: %s.", probe, msg)
+}
+
+// evidenceForProbe keeps findings the failed probe did produce before the
+// failure, such as partial per-branch findings, as evidence.
+func evidenceForProbe(in Input, probe string) []finding.Finding {
+	var evidence []finding.Finding
+	for i := range in.Findings {
+		if in.Findings[i].Probe == probe {
+			evidence = append(evidence, in.Findings[i])
+		}
+	}
+	return evidence
 }
 
 // DefaultBranchFinding returns the finding from the named probe for the
